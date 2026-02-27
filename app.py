@@ -1,230 +1,131 @@
-from flask import Flask, request, jsonify
-import requests
-import json
 import os
-import html
-import time
+import asyncio
+import requests
+from datetime import datetime
+import pytz
+from flask import Flask
+from telegram.ext import ApplicationBuilder
+import json
 
-# -----------------------
-# Flask app WSGI compatibile
-# -----------------------
-application = Flask(__name__)
+# -----------------------------
+# Variabili ambiente
+# -----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+API_KEY = os.getenv("RAPIDAPI_KEY")  # RapidAPI ForexFactory
 
-# -----------------------
-# Variabili d'ambiente
-# -----------------------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("CHAT_ID")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+TIMEZONE = pytz.timezone("Europe/Rome")
+notified_events = set()
 
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not WEBHOOK_SECRET:
-    raise ValueError("Assicurati di avere impostato TELEGRAM_TOKEN, CHAT_ID e WEBHOOK_SECRET!")
+# -----------------------------
+# Bot Telegram
+# -----------------------------
+application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+# -----------------------------
+# Flask keep-alive
+# -----------------------------
+app = Flask("bot")
 
-# -----------------------
-# Stato segnali trend
-# -----------------------
-last_trend_signal = {}
+@app.route("/")
+def home():
+    return "🤖 Bot economico attivo!"
 
-# -----------------------
-# Funzione invio Telegram
-# -----------------------
-def send_telegram_message(text):
+import threading
+threading.Thread(
+    target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))),
+    daemon=True
+).start()
+
+# -----------------------------
+# Fetch eventi USD/EUR high impact
+# -----------------------------
+def fetch_events():
+    url = "https://forexfactory1.p.rapidapi.com/api?function=get_list"
+    headers = {
+        "X-RapidAPI-Key": API_KEY,
+        "X-RapidAPI-Host": "forexfactory1.p.rapidapi.com",
+        "Content-Type": "application/json"
+    }
+
     try:
-        safe_text = html.escape(text)
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": safe_text,
-            "parse_mode": "HTML"
-        }
-        r = requests.post(TELEGRAM_API_URL, json=payload, timeout=10)
-        r.raise_for_status()
-        print("Messaggio inviato:", r.json())
+        response = requests.post(url, headers=headers, json={}, timeout=10)
+        data = response.json()
+        # Debug: primi 5 eventi
+        print("DEBUG API RESPONSE:", json.dumps(data.get("events", [])[:5], indent=2))
     except Exception as e:
-        print(f"Errore invio Telegram: {e}")
+        print("Errore API:", e)
+        return []
 
-# -----------------------
-# Formatta messaggio trade
-# -----------------------
-def format_message(data):
+    events = []
+    for item in data.get("events", []):
+        currency = item.get("currency")
+        impact_value = str(item.get("impact", "")).lower()
 
-    if not isinstance(data, dict):
-        return str(data)
+        if currency not in ["USD", "EUR"]:
+            continue
+        if impact_value != "high":
+            continue
 
-    event = data.get("event", "")
-    symbol = data.get("symbol", "")
-    timeframe = data.get("timeframe", "")
-    side = data.get("side", "").upper()
-    entry = data.get("entry")
-    exit_price = data.get("exit")
-    tp = data.get("tp")
-    sl = data.get("sl")
+        # Genera ID univoco per evitare duplicati
+        event_id = item.get("id") or f"{item.get('name', '')}_{item.get('date', '')}"
 
-    # Conversioni numeriche
-    try: entry = round(float(entry), 2)
-    except: entry = None
-    try: exit_price = round(float(exit_price), 2)
-    except: exit_price = None
-    try: tp = round(float(tp), 2)
-    except: tp = None
-    try: sl = round(float(sl), 2)
-    except: sl = None
+        events.append({
+            "id": event_id,
+            "currency": currency,
+            "headline": item.get("name"),
+            "actual": item.get("actual"),
+            "forecast": item.get("forecast"),
+            "previous": item.get("previous"),
+            "datetime": item.get("date")  # stringa o timestamp
+        })
 
-    # ---------------- CALCOLO PIPS ----------------
-    pips_value = None
-    if entry is not None and exit_price is not None:
-        if side == "LONG":
-            pips_value = exit_price - entry
-        elif side == "SHORT":
-            pips_value = entry - exit_price
-        else:
-            pips_value = exit_price - entry
-        pips_value = round(pips_value, 2)
+    return events
 
-    # Formattazione pips
-    if pips_value is not None:
-        if event == "TP_HIT":
-            pips_text = f"+{abs(pips_value):.2f} pips"
-        elif event == "SL_HIT":
-            pips_text = f"-{abs(pips_value):.2f} pips"
-        else:
-            pips_text = f"{pips_value:.2f} pips"
-    else:
-        pips_text = "N/A"
+# -----------------------------
+# Messaggio giornaliero leggibile
+# -----------------------------
+async def send_daily():
+    events = fetch_events()
+    if not events:
+        await application.bot.send_message(chat_id=CHAT_ID, text="📅 Oggi non ci sono news High Impact USD/EUR.")
+        return
 
-    # ---------------- EMOJI ----------------
-    emoji_open = {"start":"🚀", "end":"📈"} if side == "LONG" else {"start":"🔻", "end":"📉"}
-    emoji_reversal = "🔄"
-    emoji_tp = {"start":"🟢", "end":"🎯"}
-    emoji_sl = {"start":"🔴", "end":"🛑"}
-    emoji_close = {"start":"⚡️", "end":""}
-
-    # ---------------- APERTURA ----------------
-    if event in ["OPEN", "REVERSAL_OPEN"]:
-
-        if event == "REVERSAL_OPEN":
-            header = f"{emoji_reversal} {side}"
-        else:
-            header = f"{emoji_open['start']} {side} {emoji_open['end']}"
-
-        return (
-            f"{header}\n"
-            f"Pair: {symbol}\n"
-            f"Timeframe: {timeframe}\n"
-            f"Entry: {entry if entry is not None else 'N/A'}\n"
-            f"TP: {tp if tp is not None else 'N/A'} {emoji_tp['end'] if tp is not None else ''}\n"
-            f"SL: {sl if sl is not None else 'N/A'} {emoji_sl['end'] if sl is not None else ''}"
-        )
-
-    # ---------------- CHIUSURA ----------------
-    elif event in ["TP_HIT", "SL_HIT", "CLOSE"]:
-
-        if event == "TP_HIT":
-            header_start = emoji_tp["start"]
-            header_end = emoji_tp["end"]
-            event_text = "TP HIT"
-        elif event == "SL_HIT":
-            header_start = emoji_sl["start"]
-            header_end = emoji_sl["end"]
-            event_text = "SL HIT"
-        else:
-            header_start = emoji_close["start"]
-            header_end = emoji_close["end"]
-            event_text = "CLOSE"
-
-        return (
-            f"{header_start} {event_text} {header_end}\n"
-            f"{side}\n"
-            f"Pair: {symbol}\n"
-            f"Timeframe: {timeframe}\n"
-            f"Entry: {entry if entry is not None else 'N/A'}\n"
-            f"Exit: {exit_price if exit_price is not None else 'N/A'}\n"
-            f"Pips: {pips_text}"
-        )
-
-    return f"{symbol}: {event}"
-
-# -----------------------
-# Webhook principale (robusto)
-# -----------------------
-@application.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        raw_text = request.get_data(as_text=True)
-        print("RAW BODY:", raw_text)
-
-        if not raw_text:
-            print("Webhook ricevuto ma body vuoto")
-            return "Empty body", 400
-
+    msg = "📅 *High Impact USD & EUR - Oggi*\n\n"
+    for e in events:
+        dt_str = e["datetime"] or ""
         try:
-            data = json.loads(raw_text)
-        except json.JSONDecodeError as e:
-            print("JSON non valido:", e)
-            return "Invalid JSON", 400
+            # prova a parsare come timestamp, altrimenti mostra così
+            dt_obj = datetime.fromisoformat(dt_str)
+            date_str = dt_obj.astimezone(TIMEZONE).strftime("%H:%M")
+        except:
+            date_str = dt_str
 
-        # Validazione secret
-        if data.get("secret") != WEBHOOK_SECRET:
-            print("Secret non valido")
-            return "Invalid secret", 400
+        actual = e["actual"] or "N/D"
+        forecast = e["forecast"] or "N/D"
+        previous = e["previous"] or "N/D"
 
-        symbol = data.get("symbol")
-        trend = last_trend_signal.get(symbol)
+        msg += f"*{e['headline']}* ({e['currency']})\n"
+        msg += f"🕒 {date_str} | Forecast: {forecast} | Previous: {previous} | Actual: {actual}\n\n"
 
-        # Logica reversal
-        if trend:
-            side = data.get("side", "").upper()
-            if trend["type"] == "MIN" and side == "LONG":
-                data["event"] = "REVERSAL_OPEN"
-            elif trend["type"] == "MAX" and side == "SHORT":
-                data["event"] = "REVERSAL_OPEN"
+    await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
 
-        message = format_message(data)
-        send_telegram_message(message)
+# -----------------------------
+# Scheduler
+# -----------------------------
+async def scheduler_loop():
+    print("🚀 Bot avviato correttamente")
+    await application.bot.send_message(chat_id=CHAT_ID, text="✅ Bot avviato correttamente")
 
-        return jsonify({"status": "ok"}), 200
+    await send_daily()
 
-    except Exception as e:
-        print("Errore webhook:", e)
-        return "Internal Server Error", 500
+    while True:
+        # ripete ogni 5 minuti per nuove news
+        await asyncio.sleep(300)
+        await send_daily()
 
-# -----------------------
-# Webhook trend
-# -----------------------
-@application.route("/webhook/trend", methods=["POST"])
-def trend_webhook():
-    try:
-        data = request.get_json(silent=True)
-        if not data:
-            return "Invalid JSON", 400
-
-        symbol = data.get("symbol")
-        event_type = data.get("event")
-        value = data.get("value")
-
-        last_trend_signal[symbol] = {
-            "type": event_type,
-            "value": value,
-            "ts": time.time()
-        }
-
-        return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        print("Errore trend webhook:", e)
-        return "Internal Server Error", 500
-
-# -----------------------
-# Endpoint uptime
-# -----------------------
-@application.route("/", methods=["GET"])
-def uptime():
-    return "Bot online ✅", 200
-
-# -----------------------
+# -----------------------------
 # Avvio
-# -----------------------
+# -----------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    application.run(host="0.0.0.0", port=port)
+    asyncio.run(scheduler_loop())
