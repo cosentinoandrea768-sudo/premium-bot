@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 import requests
 import json
@@ -113,9 +112,9 @@ def format_message(data):
             f"{header}\n"
             f"Pair: {symbol}\n"
             f"Timeframe: {timeframe}\n"
-            f"Entry: {entry:.2f}\n"
-            f"TP: {tp:.2f} {emoji_tp['end'] if tp is not None else ''}\n"
-            f"SL: {sl:.2f} {emoji_sl['end'] if sl is not None else ''}"
+            f"Entry: {entry if entry is not None else 'N/A'}\n"
+            f"TP: {tp if tp is not None else 'N/A'} {emoji_tp['end'] if tp is not None else ''}\n"
+            f"SL: {sl if sl is not None else 'N/A'} {emoji_sl['end'] if sl is not None else ''}"
         )
 
     # ---------------- CHIUSURA ----------------
@@ -139,29 +138,41 @@ def format_message(data):
             f"{side}\n"
             f"Pair: {symbol}\n"
             f"Timeframe: {timeframe}\n"
-            f"Entry: {entry:.2f}\n"
-            f"Exit: {exit_price:.2f}\n"
+            f"Entry: {entry if entry is not None else 'N/A'}\n"
+            f"Exit: {exit_price if exit_price is not None else 'N/A'}\n"
             f"Pips: {pips_text}"
         )
 
     return f"{symbol}: {event}"
 
 # -----------------------
-# Webhook principale
+# Webhook principale (robusto)
 # -----------------------
 @application.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        raw_data = request.data
-        data = json.loads(raw_data)
+        raw_text = request.get_data(as_text=True)
+        print("RAW BODY:", raw_text)
 
-        if "secret" not in data or data["secret"] != WEBHOOK_SECRET:
+        if not raw_text:
+            print("Webhook ricevuto ma body vuoto")
+            return "Empty body", 400
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as e:
+            print("JSON non valido:", e)
+            return "Invalid JSON", 400
+
+        # Validazione secret
+        if data.get("secret") != WEBHOOK_SECRET:
+            print("Secret non valido")
             return "Invalid secret", 400
 
-        # Logica reversal
         symbol = data.get("symbol")
         trend = last_trend_signal.get(symbol)
 
+        # Logica reversal
         if trend:
             side = data.get("side", "").upper()
             if trend["type"] == "MIN" and side == "LONG":
@@ -184,7 +195,10 @@ def webhook():
 @application.route("/webhook/trend", methods=["POST"])
 def trend_webhook():
     try:
-        data = request.json
+        data = request.get_json(silent=True)
+        if not data:
+            return "Invalid JSON", 400
+
         symbol = data.get("symbol")
         event_type = data.get("event")
         value = data.get("value")
